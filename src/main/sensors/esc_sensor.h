@@ -87,3 +87,6 @@ uint8_t escGetParamBufferLength(void);
 uint8_t *escGetParamBuffer();
 uint8_t *escGetParamUpdBuffer();
 bool escCommitParameters();
+
+uint8_t escGetDebugBufferLength(void);
+uint8_t *escGetDebugBuffer(void);

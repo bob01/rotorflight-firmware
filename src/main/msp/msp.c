@@ -814,6 +814,16 @@ static bool mspCommonProcessOutCommand(int16_t cmdMSP, sbuf_t *dst, mspPostProce
             sbufWriteData(dst, escGetParamBuffer(), len);
         }
         break;
+
+    case MSP_ESC_DEBUG:
+        {
+            const uint8_t len = escGetDebugBufferLength();
+            if (len == 0)
+                return false;
+
+            sbufWriteData(dst, escGetDebugBuffer(), len);
+        }
+        break;
 #endif
 
     case MSP_BATTERY_STATE:

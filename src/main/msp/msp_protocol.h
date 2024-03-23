@@ -247,6 +247,8 @@
 #define MSP_SET_VTXTABLE_BAND                227
 #define MSP_SET_VTXTABLE_POWERLEVEL          228
 
+#define MSP_ESC_DEBUG                        229
+
 #define MSP_MULTIPLE_MSP                     230
 #define MSP_MODE_RANGES_EXTRA                238
 #define MSP_ACC_TRIM                         240

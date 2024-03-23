@@ -2271,6 +2271,8 @@ typedef struct {
     uint16_t param;                     // parameter value
 } OpenYGEControlFrame_t;
 
+static uint8_t oygeDebugBuffer[PARAM_HEADER_SIZE + 34] = { 0, };
+static uint8_t *oygeDebug = oygeDebugBuffer + PARAM_HEADER_SIZE;
 
 static uint16_t oygeAutoFrameTimeout = OPENYGE_AUTO_INITIAL_FRAME_TIMEOUT;
 static uint64_t oygeCachedParams = 0;
@@ -2421,6 +2423,8 @@ static void oygeDecodeTelemetryFrame(void)
     DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_CAPACITY, tele->consumption);
     DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_EXTRA, tele->status1);
     DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_AGE, 0);
+
+    memcpy(oygeDebug, buffer, 34);
 }
 
 static bool oygeDecodeAuto(timeMs_t currentTimeMs)
@@ -2673,6 +2677,18 @@ bool escCommitParameters()
     return paramUpdBuffer[PARAM_HEADER_SIG] == paramBuffer[PARAM_HEADER_SIG] &&
         (paramUpdBuffer[PARAM_HEADER_VER] & PARAM_HEADER_VER_MASK) == paramBuffer[PARAM_HEADER_VER] &&
         paramCommit != NULL && paramCommit(paramUpdBuffer[PARAM_HEADER_VER] & PARAM_HEADER_CMD_MASK);
+}
+
+uint8_t escGetDebugBufferLength(void)
+{
+    return PARAM_HEADER_SIZE + 34;
+}
+
+uint8_t *escGetDebugBuffer(void)
+{
+    oygeDebugBuffer[PARAM_HEADER_SIG] = paramSig;
+    oygeDebugBuffer[PARAM_HEADER_VER] = paramVer | PARAM_HEADER_RDONLY;
+    return oygeDebugBuffer;
 }
 
 #endif
