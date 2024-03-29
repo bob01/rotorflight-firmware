@@ -2283,7 +2283,7 @@ typedef struct {
     uint16_t param;                     // parameter value
 } OpenYGEControlFrame_t;
 
-static uint8_t oygeDebugBuffer[PARAM_HEADER_SIZE + 34] = { 0, };
+static uint8_t oygeDebugBuffer[PARAM_HEADER_SIZE + TELEMETRY_BUFFER_SIZE] = { 0, };
 static uint8_t *oygeDebug = oygeDebugBuffer + PARAM_HEADER_SIZE;
 
 static uint16_t oygeAutoFrameTimeout = OPENYGE_AUTO_INITIAL_FRAME_TIMEOUT;
@@ -2450,7 +2450,7 @@ static void oygeDecodeTelemetryFrame(void)
     DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_EXTRA, tele->status1);
     DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_AGE, 0);
 
-    memcpy(oygeDebug, buffer, 34);
+    memcpy(oygeDebug, buffer, TELEMETRY_BUFFER_SIZE);
 }
 
 static const OpenYGEHeader_t *oygeGetHeaderWithCrcCheck()
