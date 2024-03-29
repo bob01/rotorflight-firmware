@@ -133,8 +133,8 @@ static uint8_t buffer[TELEMETRY_BUFFER_SIZE] = { 0, };
 static volatile uint8_t bufferSize = 0;
 static volatile uint8_t bufferPos = 0;
 
-static uint8_t  readBytes = 0;
-static uint8_t  readIngoreBytes = 0;
+static volatile uint8_t readBytes = 0;
+static volatile uint8_t readIngoreBytes = 0;
 static uint32_t syncCount = 0;
 
 static uint8_t reqLength = 0;
@@ -1547,7 +1547,7 @@ static uint16_t rrfsmBootDelayMs = 0;
 static uint8_t rrfsmMinFrameLength = 0;
 
 static uint32_t rrfsmFrameTimestamp = 0;
-static uint8_t rrfsmFrameLength = 0;
+static volatile uint8_t rrfsmFrameLength = 0;
 static uint16_t rrfsmFramePeriod = 0;
 static uint16_t rrfsmFrameTimeout = 0;
 
@@ -2453,11 +2453,27 @@ static void oygeDecodeTelemetryFrame(void)
     memcpy(oygeDebug, buffer, 34);
 }
 
+static const OpenYGEHeader_t *oygeGetHeaderWithCrcCheck()
+{
+    // get header (w/ paranoid buffer access)
+    const OpenYGEHeader_t *hdr = (OpenYGEHeader_t*)buffer;
+    const uint8_t len = hdr->frame_length;
+    if (len < OPENYGE_MIN_FRAME_LENGTH || len > TELEMETRY_BUFFER_SIZE)
+        return NULL;
+
+    // check CRC
+    const uint16_t crc = buffer[len - 1] << 8 | buffer[len - 2];
+    if (oygeCalculateCRC16_CCITT(buffer, len - 2) != crc)
+        return NULL;
+
+    return hdr;
+}
+
 static bool oygeDecodeAuto(timeMs_t currentTimeMs)
 {
-    // verify CRC16 checksum
-    const uint16_t crc = buffer[rrfsmFrameLength - 1] << 8 | buffer[rrfsmFrameLength - 2];
-    if (oygeCalculateCRC16_CCITT(buffer, rrfsmFrameLength - 2) != crc)
+    // get header w/ CRC check
+    const OpenYGEHeader_t *hdr = oygeGetHeaderWithCrcCheck();
+    if (hdr == NULL)
         return false;
         
     // decode payload
@@ -2497,12 +2513,11 @@ static bool oygeDecodeTelemetry(const OpenYGEHeader_t *hdr, timeMs_t currentTime
 
 static bool oygeDecode(timeMs_t currentTimeMs)
 {
-    // verify CRC16 checksum
-    const uint16_t crc = buffer[rrfsmFrameLength - 1] << 8 | buffer[rrfsmFrameLength - 2];
-    if (oygeCalculateCRC16_CCITT(buffer, rrfsmFrameLength - 2) != crc)
+    // get header w/ CRC check
+    const OpenYGEHeader_t *hdr = oygeGetHeaderWithCrcCheck();
+    if (hdr == NULL)
         return false;
 
-    const OpenYGEHeader_t *hdr = (OpenYGEHeader_t*)buffer;
     switch (hdr->frame_type) {
         case OPENYGE_FTYPE_TELE_AUTO:
         case OPENYGE_FTYPE_TELE_RESP:
@@ -2535,8 +2550,8 @@ static int8_t oygeAccept(uint16_t c)
     }
     else if (readBytes == 4) {
         // frame length
-        if (c > TELEMETRY_BUFFER_SIZE) {
-            // protect against buffer overflow
+        if (c < OPENYGE_MIN_FRAME_LENGTH || c > TELEMETRY_BUFFER_SIZE) {
+            // protect against buffer underflow/overflow
             return -1;
         }
         else {
