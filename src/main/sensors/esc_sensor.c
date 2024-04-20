@@ -1773,9 +1773,11 @@ static void rrfsmSensorProcess(timeUs_t currentTimeUs)
  */
 #define TRIB_REQ_WRITE                  0x80                // request write bit
 #define TRIB_REQ_SIG                    0x50                // request signature bits
-#define TRIB_BOOT_DELAY                 4000                // 4 seconds
+#define TRIB_BOOT_DELAY                 10000               // 10 seconds quiet time before expecting first frame
 #define TRIB_HEADER_LENGTH              6                   // assume header only until actual length of current frame known
+#define TRIB_UNC_HEADER_LENGTH          4                   // UNC packet header length
 #define TRIB_FRAME_PERIOD               100                 // aim for approx. 20Hz (note UNC is 10Hz, may have to reduce this)
+#define TRIB_REQ_BOOT_DELAY             4000                // 4 seconds quiet time before ESC requests
 #define TRIB_REQ_READ_TIMEOUT           200                 // Response timeout for read requests
 #define TRIB_REQ_WRITE_TIMEOUT          1200                // Response timeout for write requests
 #define TRIB_RESP_FRAME_TIMEOUT         200                 // Response timeout depends on ESC business but no more than 200ms
@@ -1797,7 +1799,6 @@ typedef enum {
     TRIB_UNCSETUP_WAIT,
 } tribUncSetup_e;
 
-static bool tribUncMode = true;
 static tribUncSetup_e tribUncSetup = TRIB_UNCSETUP_INACTIVE;
 
 // param ranges - hibyte=addr (system region if 0x80 set or setting region otherwise), lobyte=length
@@ -1949,14 +1950,8 @@ static bool tribDecodeReadParamResp(uint8_t addr)
             tribInvalidParams &= ~(1 << i);
 
             // make param payload available if all params cached
-            if (tribInvalidParams == 0 && paramPayloadLength == 0) {
-                if (tribUncMode) {
-                    tribUncSetup = TRIB_UNCSETUP_PARAMSREADY;
-                }
-                else {
-                    paramPayloadLength = tribCalcParamBufferLength();
-                }
-            }
+            if (tribInvalidParams == 0 && paramPayloadLength == 0)
+                tribUncSetup = TRIB_UNCSETUP_PARAMSREADY;
             return true;
         }
         offset += len;
@@ -1979,11 +1974,6 @@ static bool tribDecodeWriteParamResp(uint8_t addr)
     return false;
 }
 
-static void tribBuildNextStatusReq(void)
-{
-    tribBuildReq(0x51, 0, NULL, 16, TRIB_FRAME_PERIOD, TRIB_RESP_FRAME_TIMEOUT);
-}
-
 static bool tribValidateResponseHeader(void)
 {
     // req and resp headers should match except for len ([4]) which may differ
@@ -2003,15 +1993,8 @@ static bool tribDecodeReadSettingResp(uint8_t sysbit)
         return false;
 
     const uint8_t addr = buffer[3];
-    if (tribUncMode) {
-        if (!tribDecodeReadParamResp(addr | sysbit) || !tribBuildNextParamReq()) {
-            rrfsmInvalidateReq();
-        }
-    }
-    else {
-        tribDecodeReadParamResp(addr | sysbit);
-        tribBuildNextStatusReq();
-    }
+    if (!tribDecodeReadParamResp(addr | sysbit) || !tribBuildNextParamReq())
+        rrfsmInvalidateReq();
 
     return true;
 }
@@ -2023,15 +2006,8 @@ static bool tribDecodeWriteSettingResp(void)
         return false;
 
     const uint8_t addr = buffer[3];
-    if (tribUncMode) {
-        if (!tribDecodeWriteParamResp(addr) || !tribBuildNextParamReq()) {
-            rrfsmInvalidateReq();
-        }
-    }
-    else {
-        tribDecodeWriteParamResp(addr);
-        tribBuildNextStatusReq();
-    }
+    if (!tribDecodeWriteParamResp(addr) || !tribBuildNextParamReq())
+        rrfsmInvalidateReq();
 
     return true;
 }
@@ -2087,31 +2063,17 @@ static bool tribDecodeReadStatusResp(void)
         rrfsmInvalidateReq();
         return true;
     }
-
-    // decode as 6 byte header + 16 byte (Log_rec_t) payload
-    if (!tribDecodeLogRecord(6))
-        return false;
-
-    // schedule next request
-    if (!tribBuildNextParamReq())
-        tribBuildNextStatusReq();
-
-    return true;
+    return false;
 }
 
 static bool tribDecodeUNCFrame(void)
 {
     // validate CRC, decode as 4 byte header + 16 byte (Log_rec_t) payload
     const uint16_t crc = buffer[rrfsmFrameLength - 1] << 8 | buffer[rrfsmFrameLength - 2];
-    if (calculateCRC16_CCITT(buffer, 20) != crc || !tribDecodeLogRecord(4))
+    if (calculateCRC16_CCITT(buffer, 20) != crc || !tribDecodeLogRecord(TRIB_UNC_HEADER_LENGTH))
         return false;
 
-    // switch to UNC mode on UNC frame received
-    if (!tribUncMode) {
-        tribUncMode = true;
-        tribUncSetup = TRIB_UNCSETUP_INACTIVE;
-        rrfsmFrameTimeout = TRIB_UNC_FRAME_TIMEOUT;
-    }
+    rrfsmFrameTimeout = TRIB_UNC_FRAME_TIMEOUT;
     return true;
 }
 
@@ -2136,7 +2098,7 @@ static bool tribDecode(timeMs_t currentTimeMs)
     }
 }
 
-static bool tribCrank(timeMs_t currentTimeMs)
+static bool tribCrankUncSetup(timeMs_t currentTimeMs)
 {
     switch(tribUncSetup) {
         case TRIB_UNCSETUP_INACTIVE:
@@ -2169,11 +2131,7 @@ static bool tribStart(timeMs_t currentTimeMs)
 {
     UNUSED(currentTimeMs);
 
-    if (tribUncMode)
-        tribBuildNextParamReq();
-    else
-        tribBuildReq(0x51, 0, NULL, 0x10, TRIB_FRAME_PERIOD, TRIB_RESP_FRAME_TIMEOUT);
-
+    tribBuildNextParamReq();
     return true;
 }
 
@@ -2217,19 +2175,28 @@ static int8_t tribAccept(uint16_t c)
 
 static serialReceiveCallbackPtr tribSensorInit(bool bidirectional)
 {
-    rrfsmBootDelayMs = TRIB_BOOT_DELAY;
     rrfsmMinFrameLength = TRIB_HEADER_LENGTH;
     rrfsmAccept = tribAccept;
-    rrfsmStart = tribStart;
     rrfsmDecode = tribDecode;
-    rrfsmCrank = tribCrank;
 
     if (bidirectional) {
+        // request/response telemetry
+        rrfsmBootDelayMs = TRIB_REQ_BOOT_DELAY;
+        rrfsmStart = tribStart;
+    
         // enable ESC parameter reads and writes, reset
         paramSig = TRIB_PARAM_SIG;
         paramVer = 0 | TRIB_PARAM_CAP_RESET;
         paramCommit = tribParamCommit;
         tribInvalidateParams();
+        
+        // enable UNC setup FSM 
+        rrfsmCrank = tribCrankUncSetup;
+    }
+    else {
+        // telemetry data only
+        rrfsmBootDelayMs = TRIB_BOOT_DELAY;
+        rrfsmFrameTimeout = TRIB_UNC_FRAME_TIMEOUT;
     }
 
     return rrfsmDataReceive;
@@ -2290,7 +2257,7 @@ static serialReceiveCallbackPtr tribSensorInit(bool bidirectional)
 #define OPENYGE_REQ_WRITE_TIMEOUT           400                 // Response timeout for write requests  TBD: confirm
 
 #define OPENYGE_PARAM_SIG                   0xA5                // parameter payload signature for this ESC
-#define OPENYGE_MAX_PARAM_CACHE_SIZE        64                  // limited by use of uint64_t as bit array for oygeCachedParams
+#define OPENYGE_PARAM_CACHE_SIZE_MAX        64                  // limited by use of uint64_t as bit array for oygeCachedParams
 
 #define OPENYGE_FTYPE_TELE_AUTO             0x00                // auto telemetry frame
 #define OPENYGE_FTYPE_TELE_RESP             0x02                // telemetry response
@@ -2390,7 +2357,7 @@ static bool oygeParamCommit(uint8_t cmd)
 static void oygeCacheParam(uint8_t pidx, uint16_t pdata)
 {
     const uint8_t maxParams = PARAM_BUFFER_SIZE / 2;
-    if (pidx >= maxParams || pidx >= OPENYGE_MAX_PARAM_CACHE_SIZE)
+    if (pidx >= maxParams || pidx >= OPENYGE_PARAM_CACHE_SIZE_MAX)
         return;
 
     // don't accept params until pending writes cleared
@@ -2407,7 +2374,7 @@ static void oygeCacheParam(uint8_t pidx, uint16_t pdata)
 
     // make param payload available if all params cached
     const uint16_t ygeParamCount = ygeParams[0];
-    if (ygeParamCount > 0 && ygeParamCount <= OPENYGE_MAX_PARAM_CACHE_SIZE &&
+    if (ygeParamCount > 0 && ygeParamCount <= OPENYGE_PARAM_CACHE_SIZE_MAX &&
         ~(~1ULL << (ygeParamCount - 1)) == oygeCachedParams) {
         paramPayloadLength = ygeParamCount * 2;
     }
