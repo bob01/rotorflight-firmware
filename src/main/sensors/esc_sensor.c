@@ -99,8 +99,8 @@ enum {
     DEBUG_FRAME_BUFFER,
 };
 
-#define TELEMETRY_BUFFER_SIZE    40
-#define REQUEST_BUFFER_SIZE      40
+#define TELEMETRY_BUFFER_SIZE    140
+#define REQUEST_BUFFER_SIZE      64
 #define PARAM_BUFFER_SIZE        96
 #define PARAM_HEADER_SIZE        2
 #define PARAM_HEADER_SIG         0
@@ -109,6 +109,9 @@ enum {
 #define PARAM_HEADER_CMD_MASK    0xC0
 #define PARAM_HEADER_RDONLY      0x40
 #define PARAM_HEADER_USER        0x80
+
+#define PARAM_OOB_FLAG           0x0F00
+#define PARAM_OOB_NEED_RESTART   0xFF
 
 static serialPort_t *escSensorPort = NULL;
 
@@ -152,6 +155,23 @@ static bool paramMspActive = false;
 // called on MSP_SET_ESC_PARAMETERS when paramUpdPayload / paramUpdBuffer ready
 typedef bool (*paramCommitCallbackPtr)(uint8_t cmd);
 static paramCommitCallbackPtr paramCommit = NULL;
+
+
+static void paramOobEscNeedRestart(void)
+{
+    escSensorData[0].age = 0;
+    escSensorData[0].status = PARAM_OOB_FLAG | PARAM_OOB_NEED_RESTART;
+}
+
+static void paramOobEscSig(void)
+{
+    // every 128'th call
+    static uint8_t oobSigSpin = 0;
+    if (((oobSigSpin++) & 0x7F) != 0)
+        return;
+    escSensorData[0].age = 0;
+    escSensorData[0].status = PARAM_OOB_FLAG | paramSig;
+}
 
 
 bool isEscSensorActive(void)
@@ -859,143 +879,6 @@ static void hw5SensorProcess(timeUs_t currentTimeUs)
 
 
 /*
- * Scorpion Unsolicited Telemetry
- *
- *    - ESC must be set to "Unsolicited mode"
- *    - Serial protocol is 38400,8N1
- *    - Frame rate running:10Hz idle:1Hz
- *    - Little-Endian fields
- *    - CRC16-CCITT
- *    - Error Code bits:
- *         0:  N/A
- *         1:  BEC voltage error
- *         2:  Temperature error
- *         3:  Consumption error
- *         4:  Input voltage error
- *         5:  Current error
- *         6:  N/A
- *         7:  Throttle error
- *
- * Frame Format
- * ――――――――――――――――――――――――――――――――――――――――――――――――――――――――
- *      0:      Header Sync (0x55)
- *      1:      Message format version (0x00)
- *      2:      Message Length incl. header and CRC (22)
- *      3:      Device ID
- *    4-6:      Timestamp ms
- *      7:      Throttle in 0.5%
- *    8-9:      Current in 0.1A
- *  10-11:      Voltage in 0.1V
- *  12-13:      Consumption in mAh
- *     14:      Temperature in °C
- *     15:      PWM duty cycle in 0.5%
- *     16:      BEC voltage in 0.1V
- *  17-18:      RPM in 5rpm steps
- *     19:      Error code
- *  20-21:      CRC16 CCITT
- *
- */
-
-static uint16_t calculateCRC16_CCITT(const uint8_t *ptr, size_t len)
-{
-    uint16_t crc = 0;
-
-    while (len--) {
-        crc ^= *ptr++;
-        for (int i = 0; i < 8; i++)
-            crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : (crc >> 1);
-    }
-
-    return crc;
-}
-
-static bool processUNCTelemetryStream(uint8_t dataByte)
-{
-    totalByteCount++;
-
-    buffer[readBytes++] = dataByte;
-
-    if (readBytes == 1) {
-        if (dataByte != 0x55)
-            frameSyncError();
-    }
-    else if (readBytes == 2) {
-        if (dataByte != 0x00)  // Proto v0
-            frameSyncError();
-    }
-    else if (readBytes == 3) {
-        if (dataByte != 22)  // Message v0 is 22 bytes
-            frameSyncError();
-        else
-            syncCount++;
-    }
-    else if (readBytes == 22) {
-        readBytes = 0;
-        return true;
-    }
-
-    return false;
-}
-
-static void uncSensorProcess(timeUs_t currentTimeUs)
-{
-    // check for any available bytes in the rx buffer
-    while (serialRxBytesWaiting(escSensorPort)) {
-        if (processUNCTelemetryStream(serialRead(escSensorPort))) {
-            uint16_t crc = buffer[21] << 8 | buffer[20];
-
-            if (calculateCRC16_CCITT(buffer, 20) == crc) {
-                uint16_t rpm = buffer[18] << 8 | buffer[17];
-                uint16_t temp = buffer[14];
-                uint16_t throttle = buffer[7];
-                uint16_t power = buffer[15];
-                uint16_t voltage = buffer[11] << 8 | buffer[10];
-                uint16_t current = buffer[9] << 8 | buffer[8];
-                uint16_t capacity = buffer[13] << 8 | buffer[12];
-                uint16_t voltBEC = buffer[16];
-                uint16_t status = buffer[19];
-
-                escSensorData[0].age = 0;
-                escSensorData[0].erpm = rpm * 5;
-                escSensorData[0].throttle = throttle * 5;
-                escSensorData[0].pwm = power * 5;
-                escSensorData[0].voltage = voltage * 100;
-                escSensorData[0].current = current * 100;
-                escSensorData[0].consumption = capacity;
-                escSensorData[0].temperature = temp * 10;
-                escSensorData[0].bec_voltage = voltBEC * 100;
-                escSensorData[0].status = status;
-
-                DEBUG(ESC_SENSOR, DEBUG_ESC_1_RPM, rpm * 5);
-                DEBUG(ESC_SENSOR, DEBUG_ESC_1_TEMP, temp * 10);
-                DEBUG(ESC_SENSOR, DEBUG_ESC_1_VOLTAGE, voltage * 10);
-                DEBUG(ESC_SENSOR, DEBUG_ESC_1_CURRENT, current * 10);
-
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_RPM, rpm);
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_PWM, power);
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_TEMP, temp);
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_VOLTAGE, voltage);
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_CURRENT, current);
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_CAPACITY, capacity);
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_EXTRA, status);
-                DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_AGE, 0);
-
-                dataUpdateUs = currentTimeUs;
-
-                totalFrameCount++;
-            }
-            else {
-                totalCrcErrorCount++;
-            }
-        }
-    }
-
-    // Maximum frame spacing 1000ms
-    checkFrameTimeout(currentTimeUs, 1200000);
-}
-
-
-/*
  * Kontronik Telemetry V4 (23.11.2018)
  *
  *    - Serial protocol is 115200,8E1
@@ -1051,6 +934,12 @@ static void uncSensorProcess(timeUs_t currentTimeUs)
  *  36-39:      CRC32
  *
  */
+#define KON_FRAME_LENGTH                40
+#define KON_FRAME_LENGTH_LEGACY         38
+#define KON_CRC_LENGTH                  4
+
+static uint8_t kontronikPacketLength    = 0;    // 40 or 38 byte
+static uint8_t kontronikCrcExclude      = 0;    // 0 or 2
 
 static uint32_t calculateCRC32(const uint8_t *ptr, size_t len)
 {
@@ -1063,6 +952,11 @@ static uint32_t calculateCRC32(const uint8_t *ptr, size_t len)
     }
 
     return ~crc;
+}
+
+static uint32_t kontronikDecodeCRC(uint8_t index)
+{
+    return buffer[index + 3] << 24 | buffer[index + 2] << 16 | buffer[index + 1] << 8 | buffer[index];
 }
 
 static bool processKontronikTelemetryStream(uint8_t dataByte)
@@ -1089,7 +983,36 @@ static bool processKontronikTelemetryStream(uint8_t dataByte)
         else
             syncCount++;
     }
-    else if (readBytes == 40) {
+    else if (readBytes == kontronikPacketLength) {
+        readBytes = 0;
+        return true;
+    }
+    else if (kontronikPacketLength == 0 && readBytes == KON_FRAME_LENGTH_LEGACY) {
+        // auto detect legacy 38 byte packet...
+        uint32_t crc = kontronikDecodeCRC(KON_FRAME_LENGTH_LEGACY - KON_CRC_LENGTH);
+        if (calculateCRC32(buffer, KON_FRAME_LENGTH_LEGACY - 2 - KON_CRC_LENGTH) == crc) {
+            // ...w/ 32 byte payload (2 bytes excluded)
+            kontronikPacketLength = KON_FRAME_LENGTH_LEGACY;
+            kontronikCrcExclude = 2;
+            readBytes = 0;
+            return true;
+        }
+        else if (calculateCRC32(buffer, KON_FRAME_LENGTH_LEGACY - KON_CRC_LENGTH) == crc) {
+            // ...w/ 34 byte payload
+            kontronikPacketLength = KON_FRAME_LENGTH_LEGACY;
+            kontronikCrcExclude = 0;
+            readBytes = 0;
+            return true;
+        }
+    }
+    else if (kontronikPacketLength == 0 && readBytes == KON_FRAME_LENGTH) {
+        // auto detect 40 byte packet...
+        uint32_t crc = kontronikDecodeCRC(KON_FRAME_LENGTH - KON_CRC_LENGTH);
+        if (calculateCRC32(buffer, KON_FRAME_LENGTH - KON_CRC_LENGTH) == crc) {
+            // ...w/ 36 byte payload
+            kontronikPacketLength = KON_FRAME_LENGTH;
+            kontronikCrcExclude = 0;
+        }
         readBytes = 0;
         return true;
     }
@@ -1102,9 +1025,8 @@ static void kontronikSensorProcess(timeUs_t currentTimeUs)
     // check for any available bytes in the rx buffer
     while (serialRxBytesWaiting(escSensorPort)) {
         if (processKontronikTelemetryStream(serialRead(escSensorPort))) {
-            uint32_t crc = buffer[39] << 24 | buffer[38] << 16 | buffer[37] << 8 | buffer[36];
-
-            if (calculateCRC32(buffer, 36) == crc) {
+            uint32_t crc = kontronikDecodeCRC(kontronikPacketLength - KON_CRC_LENGTH);
+            if (calculateCRC32(buffer, kontronikPacketLength - kontronikCrcExclude - KON_CRC_LENGTH) == crc) {
                 uint32_t rpm = buffer[7] << 24 | buffer[6] << 16 | buffer[5] << 8 | buffer[4];
                 int16_t  throttle = (int8_t)buffer[24];
                 uint16_t pwm = buffer[23] << 8 | buffer[22];
@@ -1115,8 +1037,7 @@ static void kontronikSensorProcess(timeUs_t currentTimeUs)
                 int16_t  tempBEC = (int8_t)buffer[27];
                 uint16_t currBEC = buffer[19] << 8 | buffer[18];
                 uint16_t voltBEC = buffer[21] << 8 | buffer[20];
-                uint16_t status1 = buffer[29] << 8 | buffer[28];
-                uint16_t status2 = buffer[31] << 8 | buffer[30];
+                uint32_t status = buffer[31] << 24 | buffer[30] << 16 | buffer[29] << 8 | buffer[28];
 
                 escSensorData[0].age = 0;
                 escSensorData[0].erpm = rpm;
@@ -1129,7 +1050,7 @@ static void kontronikSensorProcess(timeUs_t currentTimeUs)
                 escSensorData[0].temperature2 = tempBEC * 10;
                 escSensorData[0].bec_voltage = voltBEC;
                 escSensorData[0].bec_current = currBEC;
-                escSensorData[0].status = status2 << 16 | status1;
+                escSensorData[0].status = status;
 
                 DEBUG(ESC_SENSOR, DEBUG_ESC_1_RPM, rpm);
                 DEBUG(ESC_SENSOR, DEBUG_ESC_1_TEMP, tempFET * 10);
@@ -1548,7 +1469,7 @@ static void apdSensorProcess(timeUs_t currentTimeUs)
 typedef int8_t (*rrfsmAcceptCallbackPtr)(uint16_t c);
 
 typedef bool (*rrfsmStartCallbackPtr)(timeMs_t currentTimeMs);  // return true to continue w/ default initialization (if in doubt return true)
-typedef bool (*rrfsmDecodeCallbackPtr)(timeMs_t currentTimeMs); // return true if frame was decoded successfully
+typedef bool (*rrfsmDecodeCallbackPtr)(timeUs_t currentTimeUs); // return true if frame was decoded successfully
 typedef bool (*rrfsmCrankCallbackPtr)(timeMs_t currentTimeMs);  // return true to continue w/ default loop (advanced, if in doubt return true)
 
 static rrfsmAcceptCallbackPtr rrfsmAccept = NULL;
@@ -1589,7 +1510,7 @@ static void rrfsmStartFrameAndSendPendingReq(timeMs_t currentTimeMs)
         serialWriteBuf(escSensorPort, reqbuffer, reqLength);
 }
 
-static void rrfsmInvalidateReq()
+static void rrfsmInvalidateReq(void)
 {
     reqbuffer[0] = 0x00;     // no req
     reqLength = 0;
@@ -1669,7 +1590,7 @@ static void rrfsmSensorProcess(timeUs_t currentTimeUs)
     }
 
     // frame complate, process, prepare for next frame
-    if (rrfsmDecode == NULL || rrfsmDecode(currentTimeMs)) {
+    if (rrfsmDecode == NULL || rrfsmDecode(currentTimeUs)) {
         // good frame, log, response handler will have prep'ed next request
         totalFrameCount++;
     }
@@ -1679,6 +1600,371 @@ static void rrfsmSensorProcess(timeUs_t currentTimeUs)
         totalCrcErrorCount++;
     }
     rrfsmStartFrame(currentTimeMs);
+}
+
+
+/*
+ * Hobbywing V5 Telemetry
+ *
+ *    - Serial protocol 115200,8N1
+ *    - Frame rate running:50Hz idle:2.5Hz
+ *    - Little-Endian fields
+ *    - Frame length over data (23)
+ *    - CRC16-MODBUS (poly 0x8005, init 0xffff)
+ *    - Fault code bits:
+ *         0:  Motor locked protection
+ *         1:  Over-temp protection
+ *         2:  Input throttle error at startup
+ *         3:  Throttle signal lost
+ *         4:  Over-current error
+ *         5:  Low-voltage error
+ *         6:  Input-voltage error
+ *         7:  Motor connection error
+ *
+ * Frame Format
+ * ――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+ *    0-5:      Sync header (0xFE 0x01 0x00 0x03 0x30 0x5C)
+ *      6:      Data frame length (23)
+ *    7-8:      Data type 0x06 0x00
+ *      9:      Throttle value in %
+ *  10-11:      Unknown
+ *     12:      Fault code
+ *  13-14:      RPM in 10rpm steps
+ *  15-16:      Voltage in 0.1V
+ *  17-18:      Current in 0.1A
+ *     19:      ESC Temperature in °C
+ *     20:      BEC Temperature in °C
+ *     21:      Motor Temperature in °C
+ *     22:      BEC Voltage in 0.1V
+ *     23:      BEC Current in 0.1A
+ *  24-29:      Unused 0xFF
+ *  30-31:      CRC16 MODBUS
+ *
+ */
+#define PL5_MIN_FRAME_LENGTH                8
+#define PL5_BOOT_DELAY                      5000
+#define PL5_TELE_FRAME_TIMEOUT              500
+#define PL5_PARAM_FRAME_PERIOD              4
+#define PL5_PARAM_READ_TIMEOUT              100
+#define PL5_PARAM_WRITE_TIMEOUT             100
+
+#define PL5_PING_FRAME_PERIOD               480
+#define PL5_PING_TIMEOUT                    1600
+
+#define PL5_PARAM_SIG                       0xFD                // parameter payload signature for this ESC
+
+#define PL5_ERR                             0x80
+
+#define PL5_FRAME_TELE_TYPE                 0x5C30
+#define PL5_FRAME_TELE_LENGTH               32
+#define PL5_RESP_PING_TYPE                  0x242C
+#define PL5_RESP_PING_LENGTH                11
+#define PL5_RESP_DEVINFO_TYPE               0x252C
+#define PL5_RESP_DEVINFO_LENGTH             73
+#define PL5_RESP_DEVINFO_PAYLOAD_LENGTH     48
+#define PL5_RESP_GETPARAMS_TYPE             0x0C30
+#define PL5_RESP_GETPARAMS_LENGTH           137
+#define PL5_RESP_GETPARAMS_PAYLOAD_LENGTH   31
+#define PL5_REQ_WRITEPARAMS_LENGTH          63
+#define PL5_RESP_WRITEPARAMS_TYPE           0x3835
+#define PL5_RESP_WRITEPARAMS_LENGTH         58
+#define PL5_RESP_WRITEPARAMS_ERR_LENGTH     9
+
+static uint8_t pl5Ping[] = { 0x1, 0xFD, 0x3, 0x3, 0x2C, 0x24, 0x0, 0x1, 0x60, 0x60 };
+static uint8_t pl5DevInfoReq[] = { 0x01, 0xFD, 0x03, 0x03, 0x2C, 0x25, 0x00, 0x20, 0xF1, 0xB8 };
+static uint8_t pl5GetParamsReq[] = { 0x1, 0xFD, 0x3, 0x3, 0x30, 0xC, 0x0, 0x40, 0x27, 0xC8 };
+static uint8_t pl5WriteParamsReq[] = { 0x1, 0xFD, 0x3, 0x17, 0x35, 0x38, 0x0, 0x18, 0x35, 0x38, 0x0, 0x18, 0x30, 0x0 };
+
+typedef struct {
+    uint8_t  throttle;                  // Throttle value in %
+    uint8_t  reserved0[2];              // reserved
+    uint8_t  fault;                     // Fault code
+    uint16_t rpm;                       // RPM in 10rpm steps
+    uint16_t voltage;                   // Voltage in 0.1V
+    uint16_t current;                   // Current in 0.1A
+    uint8_t  temperature;               // ESC Temperature in °C
+    uint8_t  bec_temp;                  // BEC Temperature in °C
+    uint8_t  motor_temp;                // Motor Temperature in °C
+    uint8_t  bec_voltage;               // BEC Voltage in 0.1V
+    uint8_t  bec_current;               // BEC Current in 0.1A
+    uint8_t  reserved1[6];              // reserved
+} Pl5TelemetryFrame_t;
+
+static bool pl5CachedDevInfo = false;
+static bool pl5CachedParams = false;
+static bool pl5DirtyParams = false;
+
+static bool pl5ParamCommit(uint8_t cmd)
+{
+    if (cmd == 0) {
+        // info should never change
+        if (memcmp(paramPayload, paramUpdPayload, PL5_RESP_DEVINFO_PAYLOAD_LENGTH) != 0)
+            return false;
+
+        // params dirty?
+        if (memcmp(paramPayload + PL5_RESP_DEVINFO_PAYLOAD_LENGTH,
+            paramUpdPayload + PL5_RESP_DEVINFO_PAYLOAD_LENGTH,
+            PL5_RESP_GETPARAMS_PAYLOAD_LENGTH) != 0) {
+            // set dirty flag, will schedule read
+            pl5DirtyParams = true;
+            // clear cached flag, will schedule write
+            pl5CachedParams = false;
+            // invalidate param payload - will be available again when params again cached (write response or re-read)
+            paramPayloadLength = 0;
+
+            // TODO: update just for testing
+            // memcpy(paramPayload + PL5_RESP_DEVINFO_PAYLOAD_LENGTH, paramUpdPayload + PL5_RESP_DEVINFO_PAYLOAD_LENGTH, PL5_RESP_GETPARAMS_PAYLOAD_LENGTH);
+        }
+            return false;
+
+        return true;
+    }
+    else {
+        // unsupported command
+        return false;
+    }
+}
+
+static bool pl5FrameReq(uint8_t len, uint16_t framePeriod, uint16_t frameTimeout)
+{
+    *(uint16_t*)(reqbuffer + len - 2) = calculateCRC16_MODBUS(reqbuffer, len - 2);
+
+    reqLength = len;
+
+    rrfsmFramePeriod = framePeriod;
+    rrfsmFrameTimeout = frameTimeout;
+
+    return true;
+}
+
+static bool pl5SendReq(void *req, uint8_t len, uint16_t framePeriod, uint16_t frameTimeout)
+{
+    if (len > REQUEST_BUFFER_SIZE)
+        return false;
+
+    memcpy(reqbuffer, req, len);
+    reqLength = len;
+
+    rrfsmFramePeriod = framePeriod;
+    rrfsmFrameTimeout = frameTimeout;
+
+    return true;
+}
+
+static void pl5BuildNextReq()
+{
+    // schedule pending param write, schedule request...
+    if (pl5DirtyParams) {
+        memset(reqbuffer, 0, PL5_REQ_WRITEPARAMS_LENGTH);
+        const uint8_t hdrlen = sizeof(pl5WriteParamsReq);
+        memcpy(reqbuffer, pl5WriteParamsReq, hdrlen);
+        memcpy(reqbuffer + hdrlen, paramUpdPayload + PL5_RESP_DEVINFO_PAYLOAD_LENGTH, PL5_RESP_GETPARAMS_PAYLOAD_LENGTH);
+        pl5FrameReq(PL5_REQ_WRITEPARAMS_LENGTH, PL5_PARAM_FRAME_PERIOD, PL5_PARAM_WRITE_TIMEOUT);
+    }
+    // ...or pending device info, schedule request...
+    else if (!pl5CachedDevInfo) {
+        pl5SendReq(pl5DevInfoReq, sizeof(pl5DevInfoReq), PL5_PARAM_FRAME_PERIOD, PL5_PARAM_READ_TIMEOUT);
+    }
+    // ...or pending param read, schedule request...
+    else if (!pl5CachedParams) {
+        pl5SendReq(pl5GetParamsReq, sizeof(pl5GetParamsReq), PL5_PARAM_FRAME_PERIOD, PL5_PARAM_READ_TIMEOUT);
+    }
+    // ...or nothing, schedule 480ms ping
+    else {
+        pl5SendReq(pl5Ping, sizeof(pl5Ping), PL5_PING_FRAME_PERIOD, PL5_PING_TIMEOUT);
+    }
+}
+
+static bool pl5DecodeTeleFrame(timeUs_t currentTimeUs)
+{
+    const Pl5TelemetryFrame_t *tele = (Pl5TelemetryFrame_t*)(buffer + 9);
+
+    // When throttle changes to zero, the last current reading is
+    // repeated until the motor has totally stopped.
+    uint16_t current = tele->current;
+    if (tele->throttle == 0)
+        current = 0;
+    setConsumptionCurrent(current * 0.1f);
+
+    escSensorData[0].age = 0;
+    escSensorData[0].erpm = tele->rpm * 10;
+    escSensorData[0].throttle = tele->throttle * 10;
+    escSensorData[0].pwm = tele->throttle * 10;
+    escSensorData[0].voltage = tele->voltage * 100;
+    escSensorData[0].current = current * 100;
+    escSensorData[0].temperature = tele->temperature * 10;
+    escSensorData[0].temperature2 = tele->bec_temp * 10;
+    escSensorData[0].bec_voltage = tele->bec_voltage * 100;
+    escSensorData[0].bec_current = tele->bec_current * 100;
+    escSensorData[0].status = tele->fault;
+
+    paramOobEscSig();
+
+    DEBUG(ESC_SENSOR, DEBUG_ESC_1_RPM, tele->rpm * 10);
+    DEBUG(ESC_SENSOR, DEBUG_ESC_1_TEMP, tele->temperature * 10);
+    DEBUG(ESC_SENSOR, DEBUG_ESC_1_VOLTAGE, tele->voltage * 10);
+    DEBUG(ESC_SENSOR, DEBUG_ESC_1_CURRENT, tele->current * 10);
+
+    DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_RPM, tele->rpm);
+    DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_PWM, tele->throttle);
+    DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_TEMP, tele->temperature);
+    DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_VOLTAGE, tele->voltage);
+    DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_CURRENT, tele->current);
+    DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_EXTRA, tele->bec_temp);
+    DEBUG(ESC_SENSOR_DATA, DEBUG_DATA_AGE, 0);
+
+    dataUpdateUs = currentTimeUs;
+
+    rrfsmFrameTimeout = PL5_TELE_FRAME_TIMEOUT;
+
+    // schedule next request
+    if (paramMspActive)
+        pl5BuildNextReq();
+
+    return true;
+}
+
+static bool pl5DecodePingResp()
+{
+    pl5BuildNextReq();
+
+    paramOobEscNeedRestart();
+
+    return true;
+}
+
+static bool pl5DecodeGetDevInfoResp()
+{
+    // cache device info
+    memcpy(paramPayload, buffer + 7, PL5_RESP_DEVINFO_PAYLOAD_LENGTH);
+    pl5CachedDevInfo = true;
+
+    pl5BuildNextReq();
+
+    return true;
+}
+
+static bool pl5DecodeGetParamsResp()
+{
+    // cache parameters, payload complete
+    memcpy(paramPayload + PL5_RESP_DEVINFO_PAYLOAD_LENGTH, buffer + 8, PL5_RESP_GETPARAMS_PAYLOAD_LENGTH);
+    pl5CachedParams = true;
+
+    // make param payload available
+    paramPayloadLength = PL5_RESP_DEVINFO_PAYLOAD_LENGTH + PL5_RESP_GETPARAMS_PAYLOAD_LENGTH;
+
+    pl5BuildNextReq();
+
+    return true;
+}
+
+static bool pl5DecodeWriteParamsResp()
+{
+    if ((buffer[3] & PL5_ERR) == 0) {
+        // success, cache parameters
+        memcpy(paramPayload + PL5_RESP_DEVINFO_PAYLOAD_LENGTH, buffer + 9, PL5_RESP_GETPARAMS_PAYLOAD_LENGTH);
+        pl5CachedParams = true;
+    }
+
+    // make param payload available
+    paramPayloadLength = PL5_RESP_DEVINFO_PAYLOAD_LENGTH + PL5_RESP_GETPARAMS_PAYLOAD_LENGTH;
+
+    // success or failure don't repeat
+    pl5DirtyParams = false;
+
+    pl5BuildNextReq();
+
+    return true;
+}
+
+static bool pl5Decode(timeUs_t currentTimeUs)
+{
+    // check CRC
+    const uint16_t crc = *(uint16_t*)(buffer + rrfsmFrameLength - 2);
+    if (calculateCRC16_MODBUS(buffer, rrfsmFrameLength - 2) != crc)
+        return false;
+
+    // decode
+    const uint16_t type = *(uint16_t*)(buffer + 4);
+    switch(type) {
+        case PL5_FRAME_TELE_TYPE:
+            return pl5DecodeTeleFrame(currentTimeUs);
+        case PL5_RESP_PING_TYPE:
+            return pl5DecodePingResp();
+        case PL5_RESP_DEVINFO_TYPE:
+            return pl5DecodeGetDevInfoResp();
+        case PL5_RESP_GETPARAMS_TYPE:
+            return pl5DecodeGetParamsResp();
+        case PL5_RESP_WRITEPARAMS_TYPE:
+            return pl5DecodeWriteParamsResp();
+        default:
+            return false;
+    }
+}
+
+static int8_t pl5Accept(uint16_t c)
+{
+    if (readBytes == 1) {
+        // frame signature
+        if (c != 0xFD && c != 0xFE)
+            return -1;
+    }
+    else if (readBytes == 6) {
+        // [3: version] [4-5: type]
+        uint8_t len = 0;
+        const uint16_t type = *(uint16_t*)(buffer + 4);
+        switch (type)
+        {
+            case PL5_FRAME_TELE_TYPE:
+                if (buffer[3] == 3)
+                    len = PL5_FRAME_TELE_LENGTH;
+                break;
+            case PL5_RESP_PING_TYPE:
+                if (buffer[3] == 3)
+                    len = PL5_RESP_PING_LENGTH;
+                break;
+            case PL5_RESP_DEVINFO_TYPE:
+                if (buffer[3] == 3)
+                    len = PL5_RESP_DEVINFO_LENGTH;
+                break;
+            case PL5_RESP_GETPARAMS_TYPE:
+                if (buffer[3] == 3)
+                    len = PL5_RESP_GETPARAMS_LENGTH;
+                break;
+            case PL5_RESP_WRITEPARAMS_TYPE:
+                if (buffer[3] == 0x17)
+                    len = PL5_RESP_WRITEPARAMS_LENGTH;
+                else if (buffer[3] == (PL5_ERR|0x17))
+                    len = PL5_RESP_WRITEPARAMS_ERR_LENGTH;
+                break;
+        }
+        if (len != 0) {
+            rrfsmFrameLength = len;
+            return 1;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static serialReceiveCallbackPtr pl5SensorInit(bool bidirectional)
+{
+    rrfsmBootDelayMs = PL5_BOOT_DELAY;
+    rrfsmMinFrameLength = PL5_MIN_FRAME_LENGTH;
+    rrfsmAccept = pl5Accept;
+    rrfsmDecode = pl5Decode;
+
+    paramSig = PL5_PARAM_SIG;
+
+    // telemetry data only
+    rrfsmFrameTimeout = PL5_TELE_FRAME_TIMEOUT;
+
+    if (bidirectional) {
+        // enable parameter writes to ESC
+        paramCommit = pl5ParamCommit;
+    }
+
+    return rrfsmDataReceive;
 }
 
 
@@ -1734,9 +2020,11 @@ static void rrfsmSensorProcess(timeUs_t currentTimeUs)
  */
 #define TRIB_REQ_WRITE                  0x80                // request write bit
 #define TRIB_REQ_SIG                    0x50                // request signature bits
-#define TRIB_BOOT_DELAY                 4000                // 4 seconds
+#define TRIB_BOOT_DELAY                 10000               // 10 seconds quiet time before expecting first frame
 #define TRIB_HEADER_LENGTH              6                   // assume header only until actual length of current frame known
+#define TRIB_UNC_HEADER_LENGTH          4                   // UNC packet header length
 #define TRIB_FRAME_PERIOD               100                 // aim for approx. 20Hz (note UNC is 10Hz, may have to reduce this)
+#define TRIB_REQ_BOOT_DELAY             4000                // 4 seconds quiet time before ESC requests
 #define TRIB_REQ_READ_TIMEOUT           200                 // Response timeout for read requests
 #define TRIB_REQ_WRITE_TIMEOUT          1200                // Response timeout for write requests
 #define TRIB_RESP_FRAME_TIMEOUT         200                 // Response timeout depends on ESC business but no more than 200ms
@@ -1750,6 +2038,16 @@ static void rrfsmSensorProcess(timeUs_t currentTimeUs)
 #define TRIB_PARAM_CAP_RESET            PARAM_HEADER_USER   // reset ESC capable
 #define TRIB_PARAM_CMD_RESET            PARAM_HEADER_USER   // reset ESC command
 
+#define TRIB_PAL_SYS_MASK               0x8000              // param address/length range system bit mask
+#define TRIB_PAL_ADDR_MASK              0x7F00              // param address/length range address mask
+#define TRIB_PAL_LEN_MASK               0x00FF              // param address/length range length mask
+
+#define TRIB_PKT_READ_SYSTEM            0x50                // read system region packet
+#define TRIB_PKT_READ_STATUS            0x51                // read status region packet
+#define TRIB_PKT_READ_SETTINGS          0x53                // read settings region packet
+#define TRIB_PKT_WRITE_SETTINGS         0xD3                // write settings region packet
+#define TRIB_PKT_UNSOLICITED            0x55                // unsolicited packet
+
 typedef enum {
     TRIB_UNCSETUP_INACTIVE = 0,
     TRIB_UNCSETUP_PARAMSREADY,
@@ -1758,7 +2056,6 @@ typedef enum {
     TRIB_UNCSETUP_WAIT,
 } tribUncSetup_e;
 
-static bool tribUncMode = true;
 static tribUncSetup_e tribUncSetup = TRIB_UNCSETUP_INACTIVE;
 
 // param ranges - hibyte=addr (system region if 0x80 set or setting region otherwise), lobyte=length
@@ -1768,6 +2065,19 @@ static uint16_t tribInvalidParams = 0;   // bit per param address range not yet 
 static uint16_t tribDirtyParams = 0;     // bit per param address that needs to be written to ESC
 static bool tribResetEsc = false;
 
+static uint16_t calculateCRC16_CCITT(const uint8_t *ptr, size_t len)
+{
+    uint16_t crc = 0;
+
+    while (len--) {
+        crc ^= *ptr++;
+        for (int i = 0; i < 8; i++)
+            crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : (crc >> 1);
+    }
+
+    return crc;
+}
+
 static bool tribParamCommit(uint8_t cmd)
 {
     if (cmd == 0) {
@@ -1776,8 +2086,8 @@ static bool tribParamCommit(uint8_t cmd)
         uint8_t offset = 0;
         for (uint8_t i = 0; i < ARRAYLEN(tribParamAddrLen); i++) {
             const uint16_t *pal = tribParamAddrLen + i;
-            const uint8_t len = *pal & 0x00FF;
-            if ((*pal & 0x8000) == 0) {
+            const uint8_t len = *pal & TRIB_PAL_LEN_MASK;
+            if ((*pal & TRIB_PAL_SYS_MASK) == 0) {
                 // schedule writes for dirty address ranges
                 if (memcmp(paramPayload + offset, paramUpdPayload + offset, len) != 0) {
                     // set dirty bit
@@ -1811,9 +2121,9 @@ static void tribBuildReq(uint8_t req, uint8_t addr, void *src, uint8_t len, uint
     reqbuffer[3] = addr;
     reqbuffer[4] = len;     // length
     reqbuffer[5] = 0;
-    reqLength = 6;
+    reqLength = TRIB_HEADER_LENGTH;
     if (src != NULL) {
-        memcpy(reqbuffer + 6, src, len);
+        memcpy(reqbuffer + TRIB_HEADER_LENGTH, src, len);
         reqLength += len;
     }
     rrfsmFramePeriod = framePeriod;
@@ -1829,7 +2139,7 @@ static uint8_t tribCalcParamBufferLength()
 {
     uint8_t len = 0;
     for (uint8_t j = 0; j < ARRAYLEN(tribParamAddrLen); j++)
-        len += (tribParamAddrLen[j] & 0x00FF);
+        len += (tribParamAddrLen[j] & TRIB_PAL_LEN_MASK);
     return len;
 }
 
@@ -1852,8 +2162,8 @@ static bool tribBuildNextParamReq(void)
     // ...or pending write request...
     uint8_t offset = 0;
     for (uint16_t *pal = tribParamAddrLen, dirtybits = tribDirtyParams; dirtybits != 0; pal++, dirtybits >>= 1) {
-        const uint8_t addr = *pal >> 8;
-        const uint8_t len = *pal & 0x00FF;
+        const uint8_t addr = (*pal & TRIB_PAL_ADDR_MASK) >> 8;
+        const uint8_t len = *pal & TRIB_PAL_LEN_MASK;
         if ((dirtybits & 0x01) != 0) {
             void *payload;
             uint32_t iq22Payload[2];
@@ -1862,14 +2172,14 @@ static bool tribBuildNextParamReq(void)
                 const uint32_t q22 = 1 << 22;
                 uint32_t *pw = iq22Payload;
                 uint32_t *pp = (uint32_t*)(paramUpdPayload + offset);
-                *pw++ = (((double)*pp++) / 100 * q22);
-                *pw = (((double)*pp) / 100000 * q22);
+                *pw++ = (((float)*pp++) / 100 * q22);
+                *pw = (((float)*pp) / 100000 * q22);
                 payload = iq22Payload;
             }
             else {
                 payload = paramUpdPayload + offset;
             }
-            tribBuildReq(0xD3, addr, payload, len, TRIB_PARAM_FRAME_PERIOD, TRIB_PARAM_WRITE_TIMEOUT);
+            tribBuildReq(TRIB_PKT_WRITE_SETTINGS, addr, payload, len, TRIB_PARAM_FRAME_PERIOD, TRIB_PARAM_WRITE_TIMEOUT);
             return true;
         }
         offset += len;
@@ -1878,7 +2188,10 @@ static bool tribBuildNextParamReq(void)
     // ...or schedule pending read request if no pending writes...
     for (uint16_t *pal = tribParamAddrLen, invalidbits = tribInvalidParams; invalidbits != 0; pal++, invalidbits >>= 1) {
         if ((invalidbits & 0x01) != 0) {
-            tribBuildReq((*pal & 0x8000) != 0 ? 0x50 : 0x53, (*pal & 0x7F00) >> 8, NULL, *pal & 0x00FF, TRIB_PARAM_FRAME_PERIOD, TRIB_PARAM_READ_TIMEOUT);
+            uint8_t req = (*pal & TRIB_PAL_SYS_MASK) != 0 ? TRIB_PKT_READ_SYSTEM : TRIB_PKT_READ_SETTINGS;
+            uint8_t addr = (*pal & TRIB_PAL_ADDR_MASK) >> 8;
+            uint8_t len = *pal & TRIB_PAL_LEN_MASK;
+            tribBuildReq(req, addr, NULL, len, TRIB_PARAM_FRAME_PERIOD, TRIB_PARAM_READ_TIMEOUT);
             return true;
         }
     }
@@ -1892,7 +2205,7 @@ static bool tribDecodeReadParamResp(uint8_t addr)
     uint8_t offset = 0;
     for (uint8_t i = 0; i < ARRAYLEN(tribParamAddrLen); i++) {
         const uint16_t *pal = tribParamAddrLen + i;
-        const uint8_t len = *pal & 0x00FF;
+        const uint8_t len = *pal & TRIB_PAL_LEN_MASK;
         if ((*pal >> 8) == addr) {
             // cache params by addr
             if (addr == TRIB_PARAM_IQ22_ADDR) {
@@ -1900,8 +2213,8 @@ static bool tribDecodeReadParamResp(uint8_t addr)
                 const uint32_t q22 = 1 << 22;
                 uint32_t *pr = (uint32_t*)(buffer + TRIB_HEADER_LENGTH);
                 uint32_t *pp = (uint32_t*)(paramPayload + offset);
-                *pp++ = round(((double)*pr++) / q22 * 100);
-                *pp = round(((double)*pr) / q22 * 100000);
+                *pp++ = roundf(((float)*pr++) / q22 * 100);
+                *pp = roundf(((float)*pr) / q22 * 100000);
             }
             else {
                 memcpy(paramPayload + offset, buffer + TRIB_HEADER_LENGTH, len);
@@ -1910,14 +2223,8 @@ static bool tribDecodeReadParamResp(uint8_t addr)
             tribInvalidParams &= ~(1 << i);
 
             // make param payload available if all params cached
-            if (tribInvalidParams == 0 && paramPayloadLength == 0) {
-                if (tribUncMode) {
-                    tribUncSetup = TRIB_UNCSETUP_PARAMSREADY;
-                }
-                else {
-                    paramPayloadLength = tribCalcParamBufferLength();
-                }
-            }
+            if (tribInvalidParams == 0 && paramPayloadLength == 0)
+                tribUncSetup = TRIB_UNCSETUP_PARAMSREADY;
             return true;
         }
         offset += len;
@@ -1940,15 +2247,10 @@ static bool tribDecodeWriteParamResp(uint8_t addr)
     return false;
 }
 
-static void tribBuildNextStatusReq(void)
-{
-    tribBuildReq(0x51, 0, NULL, 16, TRIB_FRAME_PERIOD, TRIB_RESP_FRAME_TIMEOUT);
-}
-
 static bool tribValidateResponseHeader(void)
 {
     // req and resp headers should match except for len ([4]) which may differ
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < TRIB_HEADER_LENGTH; i++) {
         if (i == 4)
             continue;
         if (buffer[i] != reqbuffer[i])
@@ -1964,15 +2266,8 @@ static bool tribDecodeReadSettingResp(uint8_t sysbit)
         return false;
 
     const uint8_t addr = buffer[3];
-    if (tribUncMode) {
-        if (!tribDecodeReadParamResp(addr | sysbit) || !tribBuildNextParamReq()) {
-            rrfsmInvalidateReq();
-        }
-    }
-    else {
-        tribDecodeReadParamResp(addr | sysbit);
-        tribBuildNextStatusReq();
-    }
+    if (!tribDecodeReadParamResp(addr | sysbit) || !tribBuildNextParamReq())
+        rrfsmInvalidateReq();
 
     return true;
 }
@@ -1984,15 +2279,8 @@ static bool tribDecodeWriteSettingResp(void)
         return false;
 
     const uint8_t addr = buffer[3];
-    if (tribUncMode) {
-        if (!tribDecodeWriteParamResp(addr) || !tribBuildNextParamReq()) {
-            rrfsmInvalidateReq();
-        }
-    }
-    else {
-        tribDecodeWriteParamResp(addr);
-        tribBuildNextStatusReq();
-    }
+    if (!tribDecodeWriteParamResp(addr) || !tribBuildNextParamReq())
+        rrfsmInvalidateReq();
 
     return true;
 }
@@ -2017,6 +2305,9 @@ static bool tribDecodeLogRecord(uint8_t hl)
     escSensorData[0].consumption = capacity;
     escSensorData[0].temperature = temp * 10;
     escSensorData[0].bec_voltage = voltBEC * 100;
+    escSensorData[0].status = status;
+
+    paramOobEscSig();
 
     DEBUG(ESC_SENSOR, DEBUG_ESC_1_RPM, rpm * 5);
     DEBUG(ESC_SENSOR, DEBUG_ESC_1_TEMP, temp * 10);
@@ -2048,56 +2339,42 @@ static bool tribDecodeReadStatusResp(void)
         rrfsmInvalidateReq();
         return true;
     }
-
-    // decode as 6 byte header + 16 byte (Log_rec_t) payload
-    if (!tribDecodeLogRecord(6))
-        return false;
-
-    // schedule next request
-    if (!tribBuildNextParamReq())
-        tribBuildNextStatusReq();
-
-    return true;
+    return false;
 }
 
 static bool tribDecodeUNCFrame(void)
 {
     // validate CRC, decode as 4 byte header + 16 byte (Log_rec_t) payload
     const uint16_t crc = buffer[rrfsmFrameLength - 1] << 8 | buffer[rrfsmFrameLength - 2];
-    if (calculateCRC16_CCITT(buffer, 20) != crc || !tribDecodeLogRecord(4))
+    if (calculateCRC16_CCITT(buffer, 20) != crc || !tribDecodeLogRecord(TRIB_UNC_HEADER_LENGTH))
         return false;
 
-    // switch to UNC mode on UNC frame received
-    if (!tribUncMode) {
-        tribUncMode = true;
-        tribUncSetup = TRIB_UNCSETUP_INACTIVE;
-        rrfsmFrameTimeout = TRIB_UNC_FRAME_TIMEOUT;
-    }
+    rrfsmFrameTimeout = TRIB_UNC_FRAME_TIMEOUT;
     return true;
 }
 
-static bool tribDecode(timeMs_t currentTimeMs)
+static bool tribDecode(timeUs_t currentTimeUs)
 {
-    UNUSED(currentTimeMs);
+    UNUSED(currentTimeUs);
 
     const uint8_t req = buffer[0];
     switch (req) {
-        case 0x51:
+        case TRIB_PKT_READ_STATUS:
             return tribDecodeReadStatusResp();
-        case 0x50:
+        case TRIB_PKT_READ_SYSTEM:
             return tribDecodeReadSettingResp(0x80);
-        case 0x53:
+        case TRIB_PKT_READ_SETTINGS:
             return tribDecodeReadSettingResp(0x00);
-        case 0xD3:
+        case TRIB_PKT_WRITE_SETTINGS:
             return tribDecodeWriteSettingResp();
-        case 0x55:
+        case TRIB_PKT_UNSOLICITED:
             return tribDecodeUNCFrame();
         default:
             return false;
     }
 }
 
-static bool tribCrank(timeMs_t currentTimeMs)
+static bool tribCrankUncSetup(timeMs_t currentTimeMs)
 {
     switch(tribUncSetup) {
         case TRIB_UNCSETUP_INACTIVE:
@@ -2108,13 +2385,14 @@ static bool tribCrank(timeMs_t currentTimeMs)
             if (paramMspActive && currentTimeMs < rrfsmFrameTimestamp + 4000) {
                 // try to abort UNC mode
                 tribUncSetup = TRIB_UNCSETUP_ABORTUNC;
-                tribBuildReq(0x51, 0, NULL, 0x10, TRIB_FRAME_PERIOD, TRIB_RESP_FRAME_TIMEOUT);
+                tribBuildReq(TRIB_PKT_READ_STATUS, 0, NULL, 0x10, TRIB_FRAME_PERIOD, TRIB_RESP_FRAME_TIMEOUT);
             }
             break;
         case TRIB_UNCSETUP_ACTIVE:
             if (tribBuildNextParamReq()) {
                 tribUncSetup = TRIB_UNCSETUP_WAIT;
             }
+            paramOobEscNeedRestart();
             break;
         case TRIB_UNCSETUP_WAIT:
             if (tribInvalidParams == 0 && tribDirtyParams == 0) {
@@ -2130,11 +2408,7 @@ static bool tribStart(timeMs_t currentTimeMs)
 {
     UNUSED(currentTimeMs);
 
-    if (tribUncMode)
-        tribBuildNextParamReq();
-    else
-        tribBuildReq(0x51, 0, NULL, 0x10, TRIB_FRAME_PERIOD, TRIB_RESP_FRAME_TIMEOUT);
-
+    tribBuildNextParamReq();
     return true;
 }
 
@@ -2145,7 +2419,7 @@ static int8_t tribAccept(uint16_t c)
         if ((c & TRIB_REQ_SIG) != TRIB_REQ_SIG)
             return -1;
     }
-    else if (buffer[0] == 0x55 && readBytes == 3) {
+    else if (buffer[0] == TRIB_PKT_UNSOLICITED && readBytes == 3) {
         // UNC length
         if (c > TELEMETRY_BUFFER_SIZE) {
             // protect against buffer overflow
@@ -2157,7 +2431,7 @@ static int8_t tribAccept(uint16_t c)
             return 1;
         }
     }
-    else if (buffer[0] != 0x55 && readBytes == 5) {
+    else if (buffer[0] != TRIB_PKT_UNSOLICITED && readBytes == 5) {
         // STD length
         if (c > TELEMETRY_BUFFER_SIZE) {
             // protect against buffer overflow
@@ -2178,19 +2452,28 @@ static int8_t tribAccept(uint16_t c)
 
 static serialReceiveCallbackPtr tribSensorInit(bool bidirectional)
 {
-    rrfsmBootDelayMs = TRIB_BOOT_DELAY;
     rrfsmMinFrameLength = TRIB_HEADER_LENGTH;
     rrfsmAccept = tribAccept;
-    rrfsmStart = tribStart;
     rrfsmDecode = tribDecode;
-    rrfsmCrank = tribCrank;
 
     if (bidirectional) {
+        // request/response telemetry
+        rrfsmBootDelayMs = TRIB_REQ_BOOT_DELAY;
+        rrfsmStart = tribStart;
+    
         // enable ESC parameter reads and writes, reset
         paramSig = TRIB_PARAM_SIG;
         paramVer = 0 | TRIB_PARAM_CAP_RESET;
         paramCommit = tribParamCommit;
         tribInvalidateParams();
+        
+        // enable UNC setup FSM 
+        rrfsmCrank = tribCrankUncSetup;
+    }
+    else {
+        // telemetry data only
+        rrfsmBootDelayMs = TRIB_BOOT_DELAY;
+        rrfsmFrameTimeout = TRIB_UNC_FRAME_TIMEOUT;
     }
 
     return rrfsmDataReceive;
@@ -2239,8 +2522,11 @@ static serialReceiveCallbackPtr tribSensorInit(bool bidirectional)
 
 #define OPENYGE_SYNC                        0xA5                // sync
 #define OPENYGE_VERSION                     3                   // protocol version
+#define OPENYGE_HEADER_LENGTH               6                   // header length
+#define OPENYGE_HEADER_LENGTH_LEGACY        4                   // legacy (pre-v3) header length
+#define OPENYGE_CRC_LENGTH                  2                   // CRC length
 #define OPENYGE_BOOT_DELAY                  5000                // 5 seconds
-#define OPENYGE_MIN_FRAME_LENGTH            6                   // assume minimum frame (header + CRC) until actual length of current frame known
+#define OPENYGE_MIN_FRAME_LENGTH            OPENYGE_HEADER_LENGTH_LEGACY + OPENYGE_CRC_LENGTH   // assume minimum frame (legacy header + CRC) until actual length of current frame known
 #define OPENYGE_AUTO_INITIAL_FRAME_TIMEOUT  900                 // intially ~800ms w/ progressive decreasing frame-period...
 #define OPENYGE_AUTO_MIN_FRAME_TIMEOUT      60U                 // ...to final ~50ms (no less)
 
@@ -2251,13 +2537,15 @@ static serialReceiveCallbackPtr tribSensorInit(bool bidirectional)
 #define OPENYGE_REQ_WRITE_TIMEOUT           400                 // Response timeout for write requests  TBD: confirm
 
 #define OPENYGE_PARAM_SIG                   0xA5                // parameter payload signature for this ESC
-#define OPENYGE_MAX_PARAM_CACHE_SIZE        64                  // limited by use of uint64_t as bit array for oygeCachedParams
+#define OPENYGE_PARAM_CACHE_SIZE_MAX        64                  // limited by use of uint64_t as bit array for oygeCachedParams
 
 #define OPENYGE_FTYPE_TELE_AUTO             0x00                // auto telemetry frame
 #define OPENYGE_FTYPE_TELE_RESP             0x02                // telemetry response
 #define OPENYGE_FTYPE_TELE_REQ              0x03                // telemetry request
 #define OPENYGE_FTYPE_WRITE_PARAM_RESP      0x04                // write param response
 #define OPENYGE_FTYPE_WRITE_PARAM_REQ       0x05                // write param request
+
+#define OPENYGE_DEV_MASTER                  0x80                // device address master role bit
 
 #define OPENYGE_TEMP_OFFSET                 40
 
@@ -2354,7 +2642,7 @@ static bool oygeParamCommit(uint8_t cmd)
 static void oygeCacheParam(uint8_t pidx, uint16_t pdata)
 {
     const uint8_t maxParams = PARAM_BUFFER_SIZE / 2;
-    if (pidx >= maxParams || pidx >= OPENYGE_MAX_PARAM_CACHE_SIZE)
+    if (pidx >= maxParams || pidx >= OPENYGE_PARAM_CACHE_SIZE_MAX)
         return;
 
     // don't accept params until pending writes cleared
@@ -2371,7 +2659,7 @@ static void oygeCacheParam(uint8_t pidx, uint16_t pdata)
 
     // make param payload available if all params cached
     const uint16_t ygeParamCount = ygeParams[0];
-    if (ygeParamCount > 0 && ygeParamCount <= OPENYGE_MAX_PARAM_CACHE_SIZE &&
+    if (ygeParamCount > 0 && ygeParamCount <= OPENYGE_PARAM_CACHE_SIZE_MAX &&
         ~(~1ULL << (ygeParamCount - 1)) == oygeCachedParams) {
         paramPayloadLength = ygeParamCount * 2;
     }
@@ -2380,7 +2668,7 @@ static void oygeCacheParam(uint8_t pidx, uint16_t pdata)
 static void oygeBuildReq(uint8_t req, uint8_t device, void *payload, uint8_t len, uint16_t framePeriod, uint16_t frameTimeout)
 {
     OpenYGEHeader_t *hdr = (OpenYGEHeader_t*)reqbuffer;
-    reqLength = sizeof(*hdr) + len + 2;     // header + payload + crc
+    reqLength = sizeof(*hdr) + len + OPENYGE_CRC_LENGTH;     // header + payload + crc
     if (reqLength > REQUEST_BUFFER_SIZE)
         return;
 
@@ -2388,13 +2676,13 @@ static void oygeBuildReq(uint8_t req, uint8_t device, void *payload, uint8_t len
     hdr->version = OPENYGE_VERSION;
     hdr->frame_type = req;
     hdr->frame_length = reqLength;
-    hdr->seq++;                             // advance sequence number, overlapped operations not supported by this implementation
-    hdr->device = device | 0x80;            // as master
+    hdr->seq++;                                 // advance sequence number, overlapped operations not supported by this implementation
+    hdr->device = device | OPENYGE_DEV_MASTER;  // as master
 
     if (payload != NULL)
         memcpy(hdr + 1, payload, len);
 
-    *((uint16_t*)(reqbuffer + reqLength - 2)) = oygeCalculateCRC16_CCITT(reqbuffer, reqLength - 2);
+    *((uint16_t*)(reqbuffer + reqLength - OPENYGE_CRC_LENGTH)) = oygeCalculateCRC16_CCITT(reqbuffer, reqLength - OPENYGE_CRC_LENGTH);
 
     rrfsmFramePeriod = framePeriod;
     rrfsmFrameTimeout = frameTimeout;
@@ -2430,7 +2718,7 @@ static void oygeBuildNextReq(const OpenYGEHeader_t *hdr)
 static void oygeDecodeTelemetryFrame(void)
 {
     const OpenYGEHeader_t *hdr = (OpenYGEHeader_t*)buffer;
-    const OpenYGETelemetryFrame_t *tele = (OpenYGETelemetryFrame_t*)(buffer + (hdr->version >= 3 ? 6 : 4));
+    const OpenYGETelemetryFrame_t *tele = (OpenYGETelemetryFrame_t*)(buffer + (hdr->version >= 3 ? OPENYGE_HEADER_LENGTH : OPENYGE_HEADER_LENGTH_LEGACY));
 
     int16_t temp = tele->temperature - OPENYGE_TEMP_OFFSET;
     int16_t tempBEC = tele->bec_temp - OPENYGE_TEMP_OFFSET;
@@ -2446,9 +2734,10 @@ static void oygeDecodeTelemetryFrame(void)
     escSensorData[0].temperature2 = tempBEC * 10;
     escSensorData[0].bec_voltage = tele->bec_voltage;
     escSensorData[0].bec_current = tele->bec_current;
-    escSensorData[0].status = tele->status1 | 0x0100;
+    escSensorData[0].status = tele->status1;
 
     oygeCacheParam(tele->pidx, tele->pdata);
+    paramOobEscSig();
 
     DEBUG(ESC_SENSOR, DEBUG_ESC_1_RPM, tele->rpm * 10);
     DEBUG(ESC_SENSOR, DEBUG_ESC_1_TEMP, temp * 10);
@@ -2476,8 +2765,8 @@ static const OpenYGEHeader_t *oygeGetHeaderWithCrcCheck()
         return NULL;
 
     // check CRC
-    const uint16_t crc = buffer[len - 1] << 8 | buffer[len - 2];
-    if (oygeCalculateCRC16_CCITT(buffer, len - 2) != crc)
+    const uint16_t crc = *(uint16_t*)(buffer + len - OPENYGE_CRC_LENGTH);
+    if (oygeCalculateCRC16_CCITT(buffer, len - OPENYGE_CRC_LENGTH) != crc)
         return NULL;
 
     return hdr;
@@ -2525,7 +2814,7 @@ static bool oygeDecodeTelemetry(const OpenYGEHeader_t *hdr, timeMs_t currentTime
     return true;
 }
 
-static bool oygeDecode(timeMs_t currentTimeMs)
+static bool oygeDecode(timeUs_t currentTimeUs)
 {
     // get header w/ CRC check
     const OpenYGEHeader_t *hdr = oygeGetHeaderWithCrcCheck();
@@ -2536,7 +2825,7 @@ static bool oygeDecode(timeMs_t currentTimeMs)
         case OPENYGE_FTYPE_TELE_AUTO:
         case OPENYGE_FTYPE_TELE_RESP:
         case OPENYGE_FTYPE_WRITE_PARAM_RESP:
-            return oygeDecodeTelemetry(hdr, currentTimeMs);
+            return oygeDecodeTelemetry(hdr, currentTimeUs / 1000);
         default:
             return false;
     }
@@ -2623,7 +2912,7 @@ static void recordSensorProcess(timeUs_t currentTimeUs)
 
 void escSensorProcess(timeUs_t currentTimeUs)
 {
-    UNUSED(uncSensorProcess);
+    UNUSED(hw5SensorProcess);
 
     if (escSensorPort && motorIsEnabled()) {
         switch (escSensorConfig()->protocol) {
@@ -2634,7 +2923,8 @@ void escSensorProcess(timeUs_t currentTimeUs)
                 hw4SensorProcess(currentTimeUs);
                 break;
             case ESC_SENSOR_PROTO_HW5:
-                hw5SensorProcess(currentTimeUs);
+                // hw5SensorProcess(currentTimeUs);
+                rrfsmSensorProcess(currentTimeUs);
                 break;
             case ESC_SENSOR_PROTO_SCORPION:
                 rrfsmSensorProcess(currentTimeUs);
@@ -2701,8 +2991,12 @@ bool INIT_CODE escSensorInit(void)
             break;
         case ESC_SENSOR_PROTO_OMPHOBBY:
         case ESC_SENSOR_PROTO_ZTW:
-        case ESC_SENSOR_PROTO_HW5:
+        // case ESC_SENSOR_PROTO_HW5:
         case ESC_SENSOR_PROTO_APD:
+            baudrate = 115200;
+            break;
+        case ESC_SENSOR_PROTO_HW5:
+            callback = pl5SensorInit(escHalfDuplex);
             baudrate = 115200;
             break;
         case ESC_SENSOR_PROTO_OPENYGE:
@@ -2734,19 +3028,19 @@ uint8_t escGetParamBufferLength(void)
     return paramPayloadLength != 0 ? PARAM_HEADER_SIZE + paramPayloadLength : 0;
 }
 
-uint8_t *escGetParamBuffer()
+uint8_t *escGetParamBuffer(void)
 {
     paramBuffer[PARAM_HEADER_SIG] = paramSig;
     paramBuffer[PARAM_HEADER_VER] = paramVer | (paramCommit == NULL ? PARAM_HEADER_RDONLY : 0);
     return paramBuffer;
 }
 
-uint8_t *escGetParamUpdBuffer()
+uint8_t *escGetParamUpdBuffer(void)
 {
     return paramUpdBuffer;
 }
 
-bool escCommitParameters()
+bool escCommitParameters(void)
 {
     return paramUpdBuffer[PARAM_HEADER_SIG] == paramBuffer[PARAM_HEADER_SIG] &&
         (paramUpdBuffer[PARAM_HEADER_VER] & PARAM_HEADER_VER_MASK) == (paramBuffer[PARAM_HEADER_VER] & PARAM_HEADER_VER_MASK) &&
