@@ -119,6 +119,10 @@ enum
     FSSP_DATAID_GOV_MODE             = 0x5450 , // custom
     FSSP_DATAID_MODEL_ID             = 0x5460 , // custom
     FSSP_DATAID_ARMING_FLAGS         = 0x5462 , // custom
+    FSSP_DATAID_ARMING_DISABLE_FLAGS = 0x5463 , // custom
+    FSSP_DATAID_BATTERY_CELL_COUNT   = 0x5464 , // custom
+    FSSP_DATAID_ESC1_STATUS          = 0x5465 , // custom
+    FSSP_DATAID_ESC1_MODEL           = 0x5466 , // custom
     FSSP_DATAID_PID_PROFILE          = 0x5471 , // custom
     FSSP_DATAID_RATES_PROFILE        = 0x5472 , // custom
 #if defined(USE_ACC)
@@ -140,7 +144,7 @@ enum
 };
 
 // if adding more sensors then increase this value (should be equal to the maximum number of ADD_SENSOR calls)
-#define MAX_DATAIDS 31
+#define MAX_DATAIDS 35
 
 static uint16_t frSkyDataIdTable[MAX_DATAIDS];
 
@@ -325,6 +329,10 @@ static void initSmartPortSensors(void)
 
     if (telemetryIsSensorEnabled(SENSOR_ARMING_FLAGS)) {
         ADD_SENSOR(FSSP_DATAID_ARMING_FLAGS);
+        ADD_SENSOR(FSSP_DATAID_ARMING_DISABLE_FLAGS);
+        ADD_SENSOR(FSSP_DATAID_BATTERY_CELL_COUNT);
+        ADD_SENSOR(FSSP_DATAID_ESC1_STATUS);
+        ADD_SENSOR(FSSP_DATAID_ESC1_MODEL);
     }
 
     if (telemetryIsSensorEnabled(SENSOR_PID_PROFILE)) {
@@ -674,6 +682,22 @@ void processSmartPortTelemetry(smartPortPayload_t *payload, volatile bool *clear
                 break;
             case FSSP_DATAID_ARMING_FLAGS    :
                 smartPortSendPackage(id, telemetrySensorValue(TELEM_ARMING_FLAGS));
+                *clearToSend = false;
+                break;
+            case FSSP_DATAID_ARMING_DISABLE_FLAGS   :
+                smartPortSendPackage(id, telemetrySensorValue(TELEM_ARMING_DISABLE_FLAGS));
+                *clearToSend = false;
+                break;
+            case FSSP_DATAID_BATTERY_CELL_COUNT     :
+                smartPortSendPackage(id, telemetrySensorValue(TELEM_BATTERY_CELL_COUNT));
+                *clearToSend = false;
+                break;
+            case FSSP_DATAID_ESC1_STATUS            :
+                smartPortSendPackage(id, telemetrySensorValue(TELEM_ESC1_STATUS));
+                *clearToSend = false;
+                break;
+            case FSSP_DATAID_ESC1_MODEL             :
+                smartPortSendPackage(id, telemetrySensorValue(TELEM_ESC1_MODEL));
                 *clearToSend = false;
                 break;
             case FSSP_DATAID_PID_PROFILE     :
